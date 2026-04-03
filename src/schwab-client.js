@@ -12,8 +12,10 @@ import { fileURLToPath } from "url";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const BASE_URL = "https://api.schwabapi.com";
-const AUTH_URL = "https://api.schwabapi.com/v1/oauth/authorize";
 const TOKEN_URL = "https://api.schwabapi.com/v1/oauth/token";
+
+const MAX_RETRIES = 3;
+const RETRY_STATUS_CODES = new Set([429, 502, 503, 504]);
 
 export class SchwabClient {
   constructor({ appKey, appSecret, callbackUrl, tokenPath }) {
@@ -22,6 +24,7 @@ export class SchwabClient {
     this.callbackUrl = callbackUrl;
     this.tokenPath = tokenPath || path.join(__dirname, "..", "tokens.json");
     this.tokens = null;
+    this._refreshPromise = null;
     this._loadTokens();
   }
 
@@ -43,7 +46,7 @@ export class SchwabClient {
       ...tokens,
       saved_at: Date.now(),
     };
-    fs.writeFileSync(this.tokenPath, JSON.stringify(this.tokens, null, 2));
+    fs.writeFileSync(this.tokenPath, JSON.stringify(this.tokens, null, 2), { mode: 0o600 });
   }
 
   isAuthenticated() {
@@ -62,7 +65,7 @@ export class SchwabClient {
       client_id: this.appKey,
       redirect_uri: this.callbackUrl,
     });
-    return `${AUTH_URL}?${params.toString()}`;
+    return `${BASE_URL}/v1/oauth/authorize?${params.toString()}`;
   }
 
   async exchangeCode(authCode) {
@@ -122,9 +125,24 @@ export class SchwabClient {
 
   async _getAccessToken() {
     if (this._isAccessTokenExpired()) {
-      await this._refreshAccessToken();
+      if (!this._refreshPromise) {
+        this._refreshPromise = this._refreshAccessToken().finally(() => {
+          this._refreshPromise = null;
+        });
+      }
+      await this._refreshPromise;
     }
     return this.tokens.access_token;
+  }
+
+  async _fetchWithRetry(url, options) {
+    for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+      const resp = await fetch(url, options);
+      if (!RETRY_STATUS_CODES.has(resp.status)) return resp;
+      const delay = Math.pow(2, attempt) * 500;
+      await new Promise((r) => setTimeout(r, delay));
+    }
+    return fetch(url, options);
   }
 
   // ─── HTTP Helpers ───────────────────────────────────────────────────
@@ -136,7 +154,7 @@ export class SchwabClient {
       if (v !== undefined && v !== null) url.searchParams.set(k, v);
     });
 
-    const resp = await fetch(url.toString(), {
+    const resp = await this._fetchWithRetry(url.toString(), {
       headers: { Authorization: `Bearer ${token}` },
     });
 
@@ -150,7 +168,7 @@ export class SchwabClient {
 
   async _post(endpoint, body) {
     const token = await this._getAccessToken();
-    const resp = await fetch(`${BASE_URL}${endpoint}`, {
+    const resp = await this._fetchWithRetry(`${BASE_URL}${endpoint}`, {
       method: "POST",
       headers: {
         Authorization: `Bearer ${token}`,
@@ -175,7 +193,7 @@ export class SchwabClient {
 
   async _delete(endpoint) {
     const token = await this._getAccessToken();
-    const resp = await fetch(`${BASE_URL}${endpoint}`, {
+    const resp = await this._fetchWithRetry(`${BASE_URL}${endpoint}`, {
       method: "DELETE",
       headers: { Authorization: `Bearer ${token}` },
     });
@@ -276,7 +294,7 @@ export class SchwabClient {
    * Build a covered call order:
    * Sell-to-open a call option against existing long shares
    */
-  static buildCoveredCallOrder(symbol, callSymbol, quantity, limitPrice) {
+  static buildCoveredCallOrder(callSymbol, quantity, limitPrice) {
     return {
       orderType: "LIMIT",
       session: "NORMAL",

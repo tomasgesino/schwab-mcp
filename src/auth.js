@@ -10,34 +10,22 @@
  * 4. This script captures the auth code and exchanges it for tokens
  */
 
-import { createServer } from "http";
 import { URL } from "url";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
+import { loadEnv } from "./env.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-// ── Load config from .env ────────────────────────────────────────────
-function loadEnv() {
-  const envPath = path.join(__dirname, "..", ".env");
-  if (!fs.existsSync(envPath)) {
-    console.error("❌ Missing .env file. Copy .env.example to .env and fill in your credentials.");
+async function main() {
+  let env;
+  try {
+    env = loadEnv();
+  } catch (e) {
+    console.error(`❌ ${e.message}`);
     process.exit(1);
   }
-  const lines = fs.readFileSync(envPath, "utf-8").split("\n");
-  const env = {};
-  for (const line of lines) {
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith("#")) continue;
-    const [key, ...rest] = trimmed.split("=");
-    env[key.trim()] = rest.join("=").trim();
-  }
-  return env;
-}
-
-async function main() {
-  const env = loadEnv();
   const appKey = env.SCHWAB_APP_KEY;
   const appSecret = env.SCHWAB_APP_SECRET;
   const callbackUrl = env.SCHWAB_CALLBACK_URL || "https://127.0.0.1:8182";
@@ -133,7 +121,7 @@ async function main() {
   tokens.saved_at = Date.now();
 
   const tokenPath = path.join(__dirname, "..", "tokens.json");
-  fs.writeFileSync(tokenPath, JSON.stringify(tokens, null, 2));
+  fs.writeFileSync(tokenPath, JSON.stringify(tokens, null, 2), { mode: 0o600 });
 
   console.log("✅ Authentication successful! Tokens saved to tokens.json\n");
   console.log(`   Access token expires in: ${tokens.expires_in}s`);

@@ -27,30 +27,14 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 import { SchwabClient } from "./schwab-client.js";
+import { loadEnv } from "./env.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 // ── Load Config ──────────────────────────────────────────────────────
-
-function loadEnv() {
-  const envPath = path.join(__dirname, "..", ".env");
-  if (!fs.existsSync(envPath)) {
-    throw new Error("Missing .env file");
-  }
-  const lines = fs.readFileSync(envPath, "utf-8").split("\n");
-  const env = {};
-  for (const line of lines) {
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith("#")) continue;
-    const [key, ...rest] = trimmed.split("=");
-    env[key.trim()] = rest.join("=").trim();
-  }
-  return env;
-}
 
 const env = loadEnv();
 const client = new SchwabClient({
@@ -126,21 +110,25 @@ server.tool(
       const positions = account?.securitiesAccount?.positions || [];
       
       // Enrich with computed fields
-      const enriched = positions.map((p) => ({
-        symbol: p.instrument?.symbol,
-        type: p.instrument?.assetType,
-        quantity: p.longQuantity - p.shortQuantity,
-        marketValue: p.marketValue,
-        averageCost: p.averagePrice,
-        currentPrice: p.currentDayProfitLoss != null
-          ? p.averagePrice + p.currentDayProfitLoss / (p.longQuantity || 1)
-          : null,
-        dayPL: p.currentDayProfitLoss,
-        dayPLPercent: p.currentDayProfitLossPercentage,
-        totalPL: p.longQuantity
-          ? (p.marketValue - p.averagePrice * p.longQuantity)
-          : null,
-      }));
+      const enriched = positions.map((p) => {
+        const netQuantity = p.longQuantity - p.shortQuantity;
+        const absQuantity = Math.abs(netQuantity);
+        return {
+          symbol: p.instrument?.symbol,
+          type: p.instrument?.assetType,
+          quantity: netQuantity,
+          marketValue: p.marketValue,
+          averageCost: p.averagePrice,
+          currentPrice: (p.currentDayProfitLoss != null && absQuantity > 0)
+            ? p.averagePrice + p.currentDayProfitLoss / absQuantity
+            : null,
+          dayPL: p.currentDayProfitLoss,
+          dayPLPercent: p.currentDayProfitLossPercentage,
+          totalPL: absQuantity > 0
+            ? (p.marketValue - p.averagePrice * absQuantity)
+            : null,
+        };
+      });
 
       return respond(enriched);
     } catch (e) {
@@ -259,7 +247,6 @@ server.tool(
   async ({ symbol, option_symbol, contracts, limit_price, dry_run, account_hash }) => {
     try {
       const order = SchwabClient.buildCoveredCallOrder(
-        symbol.toUpperCase(),
         option_symbol,
         contracts,
         limit_price
@@ -329,6 +316,22 @@ server.tool(
     try {
       const order = JSON.parse(order_payload);
 
+      // Basic validation of order structure
+      if (!order.orderType) {
+        return respondError("order_payload missing required field: orderType");
+      }
+      if (!Array.isArray(order.orderLegCollection) || order.orderLegCollection.length === 0) {
+        return respondError("order_payload missing or empty orderLegCollection");
+      }
+      for (const leg of order.orderLegCollection) {
+        if (!leg.instrument?.symbol) {
+          return respondError("Each order leg must have an instrument with a symbol");
+        }
+        if (typeof leg.quantity !== "number" || leg.quantity <= 0 || leg.quantity > 10000) {
+          return respondError(`Invalid quantity ${leg.quantity} — must be between 1 and 10,000`);
+        }
+      }
+
       if (dry_run) {
         return respond({
           mode: "DRY RUN — order NOT submitted",
@@ -348,13 +351,22 @@ server.tool(
 
 server.tool(
   "cancel_order",
-  "Cancel an open order by order ID",
+  "Cancel an open order by order ID. Preview by default — set dry_run=false to execute.",
   {
     order_id: z.string().describe("The order ID to cancel"),
+    dry_run: z.boolean().default(true).describe("Preview cancellation without executing (default: true)"),
     account_hash: z.string().optional(),
   },
-  async ({ order_id, account_hash }) => {
+  async ({ order_id, dry_run, account_hash }) => {
     try {
+      if (dry_run) {
+        return respond({
+          mode: "DRY RUN — order NOT cancelled",
+          order_id,
+          message: "Set dry_run=false to actually cancel this order.",
+        });
+      }
+
       const hash = account_hash || (await getDefaultAccountHash());
       const result = await client.cancelOrder(hash, order_id);
       return respond(result);
